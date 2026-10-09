@@ -5,168 +5,161 @@
 #include <string>
 #include <vector>
 
-/// 缓冲区编号：每个 Piece 指向一个只读的字符串缓冲区。
+/// every document offset fits in 32 bits, so we use this instead of dragging size_t around
 typedef uint32_t BufferIndex;
 
-/// 文本块（Piece）：指向某个缓冲区中的一段连续字节区间。
-/// 位置用「行号 + 该行内的字符列」表示，通过缓冲区自身的行首表换算成字节下标，
-/// 这样在只追加的缓冲区里插入文本不会让已有的 Piece 失效。
+/// A piece: one byte range inside a buffer
+/// we keep it as line + column on purpose, buffers only ever grow so a piece stays valid forever
 struct Piece
 {
-    BufferIndex bufferIndex = 0;   ///< 所属缓冲区编号
-    uint32_t startLine = 0;        ///< 起始行号（缓冲区内的行号）
-    uint32_t startColumn = 0;      ///< 起始行内字符列
-    uint32_t endLine = 0;          ///< 结束行号
-    uint32_t endColumn = 0;        ///< 结束行内字符列（不含）
-    uint32_t byteLength = 0;       ///< 字节长度
-    uint32_t newlineCount = 0;     ///< 该区间内的换行符个数
+    BufferIndex bufferIndex = 0;   // which buffer of _buffers this range lives in
+    uint32_t startLine = 0;        // head of the range, said in the buffer's own lines
+    uint32_t startColumn = 0;      // and the column inside that line, both are 0-based
+    uint32_t endLine = 0;
+    uint32_t endColumn = 0;    // exclusive, so an empty piece would have start == end
+    uint32_t byteLength = 0;   // cached on purpose: we walk the whole piece list on every lookup
+    uint32_t newlineCount = 0; // how many '\n' sit inside, i.e. how many lines this piece spans
 };
 
-/// 只读字符串缓冲区：一块文本加上它的行首字节下标表。
+/// Read-only string buffer
+/// new text goes into a fresh buffer and old ones are never touched again, that is the whole trick
 struct StringBuffer
 {
-    std::string text;                  ///< 全部文本
-    std::vector<uint32_t> lineStarts;  ///< 行首在 text 中的字节下标
+    std::string text;
+    std::vector<uint32_t> lineStarts;  // byte offset of each line start in text, element 0 is always 0
 };
 
-/// 文档中的一个位置，行号与列号均从 0 开始。
+/// Document position, both 0-based; watch out, column counts bytes here and not characters
 struct TextPosition
 {
-    uint32_t line = 0;    ///< 行号，0 基
-    uint32_t column = 0;  ///< 行内字节列，0 基
+    uint32_t line = 0;
+    uint32_t column = 0;
 };
 
-/// 一行的起点信息，供视图按行取内容与排版使用。
+/// Line start info for one line, the view asks for a single line per paint and gets it all here
 struct LineProperties
 {
-    uint32_t startOffset = 0;      ///< 该行在文档中的起始字节下标
-    uint32_t byteLength = 0;       ///< 该行的字节长度
-    uint32_t codeUnits = 0;        ///< 该行的 UTF-8 字符个数
-    bool endsWithNewline = false;  ///< 行尾是否带换行符
+    uint32_t startOffset = 0;      // byte offset of the first byte of the line
+    uint32_t byteLength = 0;       // line length without the trailing newline
+    uint32_t codeUnits = 0;        // number of UTF-8 characters
+    bool endsWithNewline = false;  // false on the last line, and then there is no break to draw
 };
 
-/// 基于 Piece Table 的文本缓冲区，纯 C++ 实现，不依赖 Qt。
-/// 按文档顺序维护一个文本块列表，每块指向只读缓冲区中的一段区间；
-/// 插入、删除只改动块列表，因此超长单行也能保持高效的局部编辑。
-/// 块数量超过上限时会整理一次，把相邻块合并回单个缓冲区，避免块列表无限增长。
+/// Piece table text buffer, plain C++
+/// Edits only rewrite the piece list, which is compacted once it grows past the limit
 class TextBuffer
 {
 public:
-    /// 构造一个空缓冲区。
+    /// starts with one empty buffer, so _buffers[0] is always safe to read
     TextBuffer();
 
-    /// 释放全部缓冲区。
     ~TextBuffer();
 
-    /// 禁止拷贝，缓冲区独占底层存储。
+    /// buffers are owned by us alone, a copy would hand the same raw pointers to two objects
     TextBuffer(const TextBuffer &) = delete;
 
-    /// 禁止赋值，缓冲区独占底层存储。
     TextBuffer &operator=(const TextBuffer &) = delete;
 
-    /// 清空全部内容，回到只有一个空行的初始状态。
+    /// drops all the text but keeps the object usable, cheaper than building a new one
     void clear();
 
-    /// 读出全部文本，单行超长时会一次性构造整个字符串，仅用于保存等场景。
+    /// Builds the whole string at once, only for saving; need a few lines? use getTextRange()
     std::string getText() const;
 
-    /// 读出 [startOffset, endOffset) 区间内的文本。
+    /// half open range [startOffset, endOffset), offsets are clamped instead of reported
     std::string getTextRange(uint32_t startOffset, uint32_t endOffset) const;
 
-    /// 读出某一行的完整文本（不含行尾换行符）。
+    /// content of one line without its newline, empty when that line does not exist
     std::string getLineContent(uint32_t line) const;
 
-    /// 读出某一行中 [column, column + unitCount) 的片段，供视图只取可见段。
+    /// unitCount counts UTF-8 characters, this is how a huge line reaches the view slice by slice
     std::string getLineSegment(uint32_t line, uint32_t column, uint32_t unitCount) const;
 
-    /// 取得某一行的起点信息。
+    /// everything about one line in one call, cached since the view keeps asking for the same line
     LineProperties lineProperties(uint32_t line) const;
 
-    /// 在 offset 处插入文本，返回插入的字节数。
-    /// 传入的 CRLF 与单独的 CR 都会被归一成 LF，保证换行符不会被块边界劈开。
+    /// CRLF and lone CR are normalized to LF here, so hand us the raw bytes and forget about them
     uint32_t insertText(uint32_t offset, const char *text, size_t byteLength);
 
-    /// 删除 [startOffset, endOffset) 区间，返回删除的字节数。
+    /// returns how many bytes really disappeared, both ends are clamped
     uint32_t deleteRange(uint32_t startOffset, uint32_t endOffset);
 
-    /// 用 text 替换 [startOffset, endOffset) 区间，返回替换前被删除的字节数。
+    /// delete then insert, returns the removed byte count just like deleteRange()
     uint32_t replaceRange(uint32_t startOffset, uint32_t endOffset, const char *text, size_t byteLength);
 
-    /// 行号、字节列换算成文档字节下标。
+    /// line/column to byte offset, both ends clamp, so a column past the line end is fine
     uint32_t offsetAt(uint32_t line, uint32_t column) const;
 
-    /// 文档字节下标换算成行号与字节列。
+    /// the slow direction, it counts '\n' one byte at a time - don't call it per visible line
     TextPosition positionAt(uint32_t offset) const;
 
-    /// 行数，空白文档也有 1 行。
     uint32_t lineCount() const { return _lineCount; }
 
-    /// 全文字节数。
     uint32_t byteCount() const { return _byteCount; }
 
-    /// 最长一行的字节数，供滚动条估算内容宽度。
     uint32_t maxLineBytes() const { return _maxLineBytes; }
 
-    /// 修改版本号，每次修改自增，供上层缓存失效使用。
+    /// Bumped on every edit so upper layers can drop caches and know their layout went stale
     uint32_t version() const { return _version; }
 
-    /// 取第 line 行的行首在文档中的字节下标。
+    /// byte offset of a line head, line 0 is always 0 and anything past the end gives byteCount()
     uint32_t lineStartOffset(uint32_t line) const;
 
-    /// 自检：校验块区间、行数与字节数是否自洽，全部正确返回 true。
+    /// full consistency check, for debugging - it recounts what the invariants promise
     bool checkIntegrity() const;
 
-    /// 自检并把失败原因写入 reason，返回 nullptr 表示一切正常。
+    /// Writes the failure reason into reason, nullptr when all is well
     const char *checkIntegrity(const char *&reason) const;
 
-    /// 打印块列表，用于调试定位。
+    /// dumps the piece list to stdout, purely a debugging helper
     void dumpTree() const;
 
 private:
-    /// 把第 index 块在块内偏移 inside 处一分为二。
+    /// Splits piece index in two at byte offset inside, a no-op when inside is 0 or the piece length
     void splitPiece(uint32_t index, uint32_t inside);
 
-    /// 合并相邻且首尾相接的块。
+    /// Merges neighbours contiguous inside one buffer, typing otherwise leaves a trail of tiny pieces
     void mergePieces();
 
-    /// 整体整理：把全部内容写进一个新的缓冲区，块列表收缩为一块。
+    /// Rewrites all text into a fresh buffer, leaving a single piece - and it is the only place
+    /// where old buffers die, which is exactly why pieces may point at them freely
     void compact();
 
-    /// 按平均块大小切分文本，避免单块过大导致切片与换算变慢。
+    /// Splits by average chunk size, never inside a UTF-8 character, so a big paste becomes many pieces
     void splitChunks(const char *text, size_t byteLength,
                      std::vector<uint32_t> &offsets, std::vector<uint32_t> &lengths) const;
 
-    /// 把一段文本登记为新缓冲区并生成对应的 Piece。
+    /// Registers text as a new buffer and builds its piece, the text is copied so you keep yours
     Piece makePiece(const char *text, size_t byteLength);
 
-    /// 重新统计总字节数、总行数与最长行。
+    /// recounts lines, bytes and the longest line, so the counters can never drift away from the pieces
     void computeBufferMetadata();
 
-    /// 查找覆盖指定字节下标的块，inside 返回块内偏移。
+    /// inside gets the offset within the piece, the result is _pieces.size() when the offset is past the end
     uint32_t pieceIndexAt(uint32_t offset, uint32_t &inside) const;
 
-    /// 取得块内容在所属缓冲区中的起始字节下标。
+    /// byte offset of the piece head inside its buffer
     uint32_t pieceStart(const Piece &piece) const;
 
-    /// 判断片段是否为 UTF-8 续字节。
+    /// a byte of the form 10xxxxxx is the tail of a multi-byte character, never a character start
     bool isUtf8Continuation(char c) const;
 
-    /// 统计一段文本中的换行符个数。
+    /// we only count '\n' here, a lone '\r' would slip through and the line table would lie
     uint32_t countNewlines(const char *data, size_t byteLength) const;
 
-    /// 统计一段文本中的 UTF-8 字符个数。
+    /// counts characters by counting every byte that is not a continuation byte, no decoding needed
     uint32_t countCodeUnits(const char *data, size_t byteLength) const;
 
-    std::vector<StringBuffer *> _buffers;  ///< 全部只读缓冲区
-    std::vector<Piece> _pieces;            ///< 按文档顺序排列的文本块
-    uint32_t _lineCount = 1;               ///< 总行数
-    uint32_t _byteCount = 0;               ///< 总字节数
-    uint32_t _maxLineBytes = 0;            ///< 最长一行的字节数
-    uint32_t _version = 0;                 ///< 修改版本号
+    std::vector<StringBuffer *> _buffers;  // raw pointers: every buffer stays alive until compact()
+    std::vector<Piece> _pieces;      // in document order, piece i starts where piece i-1 ends
+    uint32_t _lineCount = 1;         // an empty document still has one line, an empty one
+    uint32_t _byteCount = 0;
+    uint32_t _maxLineBytes = 0;      // longest line in bytes, the view sizes the h scrollbar from it
+    uint32_t _version = 0;
 
-    mutable uint32_t _cacheLine = 0;          ///< 行信息缓存：行号
-    mutable LineProperties _cacheProperties;  ///< 行信息缓存：内容
-    mutable bool _cacheValid = false;         ///< 行信息缓存是否有效
+    mutable uint32_t _cacheLine = 0;          // line info cache
+    mutable LineProperties _cacheProperties;  // one slot is enough, painting asks for one line at a time
+    mutable bool _cacheValid = false;         // any edit clears this, the cached line may be gone by then
 };
 
 #endif // TEXTBUFFER_H

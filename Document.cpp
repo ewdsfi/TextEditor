@@ -3,58 +3,25 @@
 #include <QFile>
 #include <QFileInfo>
 
-#include <string>
+// ===================== File I/O =====================
 
-/// 撤销栈保留的最大步数，超出后丢弃最早的记录。
-static const int MaxUndoSteps = 2000;
-
-/// 把 UTF-16 字节序列转换成 UTF-8 字符串。
-static std::string utf16ToUtf8(const QByteArray &data, bool bigEndian)
+/// Writes CRLF on Windows, keeps LF elsewhere
+static QByteArray outputBytes(const std::string &text)
 {
-    std::string out;
-    out.reserve(static_cast<size_t>(data.size()));
+    QByteArray bytes(text.data(), static_cast<int>(text.size()));
 
-    const unsigned char *bytes = reinterpret_cast<const unsigned char *>(data.constData());
-    const int pairCount = data.size() / 2;
+#ifdef Q_OS_WIN
+    // the buffer only ever holds LF, so the conversion happens here and we
+    // never end up writing \r\r\n, which is what a second pass would produce
+    bytes.replace('\n', QByteArray("\r\n"));
+#endif
 
-    for (int i = 0; i < pairCount; i++) {
-        uint32_t unit = bigEndian ? (static_cast<uint32_t>(bytes[i * 2]) << 8) | bytes[i * 2 + 1]
-                                  : (static_cast<uint32_t>(bytes[i * 2 + 1]) << 8) | bytes[i * 2];
-        uint32_t code = unit;
-
-        // 高位代理后面紧跟低位代理时合成一个码点
-        if (unit >= 0xD800 && unit <= 0xDBFF && i + 1 < pairCount) {
-            const uint32_t low = bigEndian ? (static_cast<uint32_t>(bytes[(i + 1) * 2]) << 8) | bytes[(i + 1) * 2 + 1]
-                                           : (static_cast<uint32_t>(bytes[(i + 1) * 2 + 1]) << 8) | bytes[(i + 1) * 2];
-
-            if (low >= 0xDC00 && low <= 0xDFFF) {
-                code = 0x10000 + ((unit - 0xD800) << 10) + (low - 0xDC00);
-                i++;
-            }
-        }
-
-        if (code < 0x80) {
-            out.push_back(static_cast<char>(code));
-        } else if (code < 0x800) {
-            out.push_back(static_cast<char>(0xC0 | (code >> 6)));
-            out.push_back(static_cast<char>(0x80 | (code & 0x3F)));
-        } else if (code < 0x10000) {
-            out.push_back(static_cast<char>(0xE0 | (code >> 12)));
-            out.push_back(static_cast<char>(0x80 | ((code >> 6) & 0x3F)));
-            out.push_back(static_cast<char>(0x80 | (code & 0x3F)));
-        } else {
-            out.push_back(static_cast<char>(0xF0 | (code >> 18)));
-            out.push_back(static_cast<char>(0x80 | ((code >> 12) & 0x3F)));
-            out.push_back(static_cast<char>(0x80 | ((code >> 6) & 0x3F)));
-            out.push_back(static_cast<char>(0x80 | (code & 0x3F)));
-        }
-    }
-
-    return out;
+    return bytes;
 }
 
 Document::Document()
 {
+    // one buffer for the whole life of the document, loadFromFile() reuses it
     _buffer = new TextBuffer();
 }
 
@@ -63,56 +30,34 @@ Document::~Document()
     delete _buffer;
 }
 
-// ---------------------------------------------------------------------------
-// 文件读写
-// ---------------------------------------------------------------------------
-
 bool Document::loadFromFile(const QString &path)
 {
     QFile file(path);
 
+    // read only, the file on disk stays untouched until the user saves
     if (!file.open(QIODevice::ReadOnly)) {
         return false;
     }
 
     QByteArray data = file.readAll();
+
     file.close();
 
-    TextEncoding encoding = EncodingUtf8;
-    std::string text;
+    // drop a leading BOM, otherwise an invisible character shows up at the top
+    const QByteArray bom = QByteArray::fromHex("EFBBBF");
 
-    if (data.size() >= 3 && static_cast<unsigned char>(data.at(0)) == 0xEF
-        && static_cast<unsigned char>(data.at(1)) == 0xBB && static_cast<unsigned char>(data.at(2)) == 0xBF) {
-        encoding = EncodingUtf8Bom;
-        text.assign(data.constData() + 3, static_cast<size_t>(data.size() - 3));
-    } else if (data.size() >= 2 && static_cast<unsigned char>(data.at(0)) == 0xFF
-               && static_cast<unsigned char>(data.at(1)) == 0xFE) {
-        encoding = EncodingUtf16Le;
-        text = utf16ToUtf8(data.mid(2), false);
-    } else if (data.size() >= 2 && static_cast<unsigned char>(data.at(0)) == 0xFE
-               && static_cast<unsigned char>(data.at(1)) == 0xFF) {
-        encoding = EncodingUtf16Be;
-        text = utf16ToUtf8(data.mid(2), true);
-    } else {
-        text.assign(data.constData(), static_cast<size_t>(data.size()));
+    if (data.startsWith(bom)) {
+        data.remove(0, bom.size());
     }
 
-    QByteArray normalized(text.data(), static_cast<int>(text.size()));
-    normalizeText(normalized);
-
+    // start from a clean slate, we can be called on a document that already has text
     _buffer->clear();
-    _buffer->insertText(0, normalized.constData(), static_cast<size_t>(normalized.size()));
+    _buffer->insertText(0, data.constData(), static_cast<size_t>(data.size()));
 
-    // 重新按文件内容推断换行风格
-    QByteArray raw = data;
-    bool mixed = false;
-    _lineEnding = detectLineEnding(raw, &mixed);
-    _encoding = encoding;
+    // from here on the document has a name, the title bar and the status bar use it
     _filePath = path;
+    // what is in the buffer is what is on disk right now, so we are not modified
     _savedVersion = _buffer->version();
-    _undoStack.clear();
-    _redoStack.clear();
-    _editCursor = 0;
 
     return true;
 }
@@ -123,26 +68,25 @@ bool Document::save()
         return false;
     }
 
-    return saveAs(_filePath);
-}
+    QFile file(_filePath);
 
-bool Document::saveAs(const QString &path)
-{
-    QFile file(path);
-
+    // truncate, we rewrite the whole file every single time
     if (!file.open(QIODevice::WriteOnly | QIODevice::Truncate)) {
         return false;
     }
 
-    const QByteArray bytes = outputBytes();
+    // the LF -> CRLF conversion lives in outputBytes(), the buffer itself is LF only
+    const QByteArray bytes = outputBytes(_buffer->getText());
     const qint64 written = file.write(bytes);
+
     file.close();
 
+    // compare the counts, a short write is a failure even though the file exists
     if (written != bytes.size()) {
         return false;
     }
 
-    _filePath = path;
+    // buffer and file agree again, so the star in the title goes away
     _savedVersion = _buffer->version();
 
     return true;
@@ -151,20 +95,15 @@ bool Document::saveAs(const QString &path)
 void Document::createNew()
 {
     _buffer->clear();
-    _undoStack.clear();
-    _redoStack.clear();
     _filePath.clear();
     _savedVersion = _buffer->version();
-    _editCursor = 0;
 }
 
 void Document::setText(const std::string &text)
 {
-    QByteArray normalized(text.data(), static_cast<int>(text.size()));
-    normalizeText(normalized);
-
+    // treat the incoming text like a fresh load, the document starts out clean
     _buffer->clear();
-    _buffer->insertText(0, normalized.constData(), static_cast<size_t>(normalized.size()));
+    _buffer->insertText(0, text.data(), text.size());
     _savedVersion = _buffer->version();
 }
 
@@ -175,11 +114,12 @@ bool Document::isEmpty() const
 
 QString Document::lineText(uint32_t line) const
 {
+    // asking for a line that isn't there is not worth a crash
     if (line >= _buffer->lineCount()) {
         return QString();
     }
 
-    // 只取这一行，超长单行不会把整个文档都复制出来
+    // only this line, so a huge single line is not copied whole
     const std::string content = _buffer->getLineContent(line);
 
     return QString::fromUtf8(content.data(), static_cast<int>(content.size()));
@@ -187,8 +127,10 @@ QString Document::lineText(uint32_t line) const
 
 QString Document::title() const
 {
+    // an unnamed document still needs something in the title bar
     QString name = _filePath.isEmpty() ? QStringLiteral("未命名") : QFileInfo(_filePath).fileName();
 
+    // the star is the only hint the user gets that there is unsaved work
     if (isModified()) {
         name += QLatin1Char('*');
     }
@@ -196,224 +138,25 @@ QString Document::title() const
     return name;
 }
 
-void Document::normalizeText(QByteArray &data)
-{
-    // 统一压成 \n，缓冲区内部因此不存在跨块的 CRLF 问题
-    data.replace("\r\n", "\n");
-    data.replace('\r', '\n');
-}
-
-QByteArray Document::outputBytes() const
-{
-    std::string text = _buffer->getText();
-    QByteArray bytes(text.data(), static_cast<int>(text.size()));
-
-    if (_lineEnding == LineEndingCrLf) {
-        bytes.replace('\n', QByteArray("\r\n"));
-    }
-
-    if (_encoding == EncodingUtf8Bom) {
-        bytes.prepend(QByteArray::fromHex("EFBBBF"));
-    }
-
-    return bytes;
-}
-
-// ---------------------------------------------------------------------------
-// 换行风格
-// ---------------------------------------------------------------------------
-
-LineEnding Document::detectLineEnding(const QByteArray &data, bool *hasMixed)
-{
-    int lf = 0;
-    int crlf = 0;
-    int cr = 0;
-
-    for (int i = 0; i < data.size(); i++) {
-        if (data.at(i) == '\n') {
-            if (i > 0 && data.at(i - 1) == '\r') {
-                crlf++;
-            } else {
-                lf++;
-            }
-        } else if (data.at(i) == '\r' && (i + 1 >= data.size() || data.at(i + 1) != '\n')) {
-            cr++;
-        }
-    }
-
-    if (hasMixed != nullptr) {
-        *hasMixed = ((lf > 0 ? 1 : 0) + (crlf > 0 ? 1 : 0) + (cr > 0 ? 1 : 0)) > 1;
-    }
-
-    if (lf == 0 && crlf == 0 && cr == 0) {
-        return LineEndingLf;
-    }
-
-    return (crlf >= lf && crlf >= cr) ? LineEndingCrLf : LineEndingLf;
-}
-
-void Document::setLineEnding(LineEnding lineEnding)
-{
-    if (_lineEnding == lineEnding) {
-        return;
-    }
-
-    _lineEnding = lineEnding;
-    convertLineEnding(lineEnding);
-    _undoStack.clear();
-    _redoStack.clear();
-}
-
-void Document::convertLineEnding(LineEnding lineEnding)
-{
-    std::string text = _buffer->getText();
-
-    if (text.empty()) {
-        return;
-    }
-
-    std::string converted;
-    converted.reserve(text.size() + text.size() / 16);
-
-    for (size_t i = 0; i < text.size(); i++) {
-        if (text[i] != '\n') {
-            converted.push_back(text[i]);
-
-            continue;
-        }
-
-        if (lineEnding == LineEndingCrLf) {
-            converted.push_back('\r');
-        }
-
-        converted.push_back('\n');
-    }
-
-    if (converted == text) {
-        return;
-    }
-
-    _buffer->clear();
-    _buffer->insertText(0, converted.data(), converted.size());
-    _savedVersion = _buffer->version();
-}
-
-// ---------------------------------------------------------------------------
-// 编辑与撤销
-// ---------------------------------------------------------------------------
+// ===================== Editing =====================
 
 uint32_t Document::insertText(uint32_t offset, const std::string &text)
 {
+    // inserting nothing is a no-op, don't bother the tree with it
     if (text.empty()) {
         return 0;
     }
 
-    UndoRecord record;
-    record.position = offset;
-    record.removedLength = 0;
-    record.insertedText = text;
-    record.cursorBefore = _editCursor;
-    record.cursorAfter = offset + static_cast<uint32_t>(text.size());
-
-    const uint32_t inserted = _buffer->insertText(offset, text.data(), text.size());
-    pushUndo(record);
-
-    return inserted;
+    return _buffer->insertText(offset, text.data(), text.size());
 }
 
 uint32_t Document::removeRange(uint32_t startOffset, uint32_t endOffset)
 {
+    // an empty or a backwards range means there is nothing to delete
     if (startOffset >= endOffset) {
         return 0;
     }
 
-    UndoRecord record;
-    record.position = startOffset;
-    record.removedLength = endOffset - startOffset;
-    record.removedText = _buffer->getTextRange(startOffset, endOffset);
-    record.cursorBefore = _editCursor;
-    record.cursorAfter = startOffset;
-
-    const uint32_t removed = _buffer->deleteRange(startOffset, endOffset);
-    pushUndo(record);
-
-    return removed;
-}
-
-uint32_t Document::replaceRange(uint32_t startOffset, uint32_t endOffset, const std::string &text)
-{
-    if (startOffset == endOffset && text.empty()) {
-        return 0;
-    }
-
-    UndoRecord record;
-    record.position = startOffset;
-    record.removedLength = (endOffset > startOffset) ? (endOffset - startOffset) : 0;
-    record.removedText = (endOffset > startOffset) ? _buffer->getTextRange(startOffset, endOffset) : std::string();
-    record.insertedText = text;
-    record.cursorBefore = _editCursor;
-    record.cursorAfter = startOffset + static_cast<uint32_t>(text.size());
-
-    const uint32_t removed = _buffer->replaceRange(startOffset, endOffset, text.data(), text.size());
-    pushUndo(record);
-
-    return removed;
-}
-
-void Document::pushUndo(const UndoRecord &record)
-{
-    if (_undoStack.size() >= MaxUndoSteps) {
-        _undoStack.removeFirst();
-    }
-
-    _undoStack.append(record);
-    _redoStack.clear();
-}
-
-bool Document::undo()
-{
-    if (_undoStack.isEmpty()) {
-        return false;
-    }
-
-    const UndoRecord record = _undoStack.takeLast();
-    _buffer->replaceRange(record.position,
-                          record.position + static_cast<uint32_t>(record.insertedText.size()),
-                          record.removedText.data(),
-                          record.removedText.size());
-    _redoStack.append(record);
-    _editCursor = record.cursorBefore;
-
-    return true;
-}
-
-bool Document::redo()
-{
-    if (_redoStack.isEmpty()) {
-        return false;
-    }
-
-    const UndoRecord record = _redoStack.takeLast();
-    _buffer->replaceRange(record.position,
-                          record.position + static_cast<uint32_t>(record.removedText.size()),
-                          record.insertedText.data(),
-                          record.insertedText.size());
-    _undoStack.append(record);
-    _editCursor = record.cursorAfter;
-
-    return true;
-}
-
-void Document::clearHistory()
-{
-    _undoStack.clear();
-    _redoStack.clear();
-}
-
-void Document::releaseUndoMemory()
-{
-    for (int i = 0; i < _undoStack.size(); i++) {
-        _undoStack[i].removedText.clear();
-        _undoStack[i].insertedText.clear();
-    }
+    // half open range: [startOffset, endOffset)
+    return _buffer->deleteRange(startOffset, endOffset);
 }

@@ -6,102 +6,99 @@
 #include <QString>
 #include <QVector>
 
-/// 单行的排版结果：把一行明文转成可测量的 UTF-16 序列，
-/// 并按固定间隔记录锚点，使得列号、字节下标与像素之间的换算不必扫描整行。
+/// Measured data of one single line: UTF-16 unit widths plus sampled anchors, all UTF-16 based
 struct LineLayout
 {
-    uint32_t line = 0;              ///< 行号
-    uint32_t byteLength = 0;        ///< 该行的字节数
-    uint32_t totalUnits = 0;        ///< 该行的 UTF-16 单元数，即最大列号
-    double width = 0.0;             ///< 该行的像素宽度
-    QString text;                   ///< 该行明文，代理对已替换成占位字符
-    QVector<qreal> widths;          ///< 每个 UTF-16 单元占的像素宽度
-    QVector<int> charBytes;         ///< 每个 UTF-16 单元的 UTF-8 字节数
-    QVector<int> anchorUnits;       ///< 锚点处的 UTF-16 单元下标
-    QVector<qreal> anchorWidths;    ///< 锚点处的累计像素宽度
-    QVector<int> anchorBytes;       ///< 锚点处的行内字节下标
+    uint32_t line = 0;
+    uint32_t byteLength = 0;
+    uint32_t totalUnits = 0;        // how many UTF-16 units the line has, this is also the max column
+    double width = 0.0;
+    QString text;                   // surrogate pairs already folded into one placeholder, see measureLine()
+    QVector<qreal> widths;          // pixel advance of every single UTF-16 unit
+    QVector<int> charBytes;         // UTF-8 byte length of every single UTF-16 unit
+    QVector<int> anchorUnits;       // sampled unit index, the next two tables must keep this same order
+    QVector<qreal> anchorWidths;
+    QVector<int> anchorBytes;
 };
 
-/// 文本排版器：按需为某一行建立排版信息，并在列号、字节下标与像素之间换算。
-/// 超长单行只测量一次并按固定间隔采样，因此光标定位与命中测试的开销与行长无关。
+/// Layout of one very long line. We only measure and sample it, so hit testing
+/// costs about the same whether the line is 1 thousand or 1 million characters long.
 class TextLayout
 {
 public:
-    /// 构造排版器，字体度量由调用方提供。
     TextLayout();
 
-    /// 设置等宽字体度量，变化后丢弃已有缓存。
+    /// give us the metrics, changing the font also throws away every cached width
     void setFontMetrics(const QFontMetricsF &metrics);
-
-    /// 登记当前行的内容并测量，内容与字节数都没变时直接复用缓存。
+    /// measure a line: its number(so we can skip work when nothing changed),
+    /// the UTF-8 length of the whole original line, and the text itself
     void setLine(uint32_t line, uint32_t byteLength, const QString &text);
 
-    /// 当前行的 UTF-16 单元数，即最大列号。
+    /// simple readers of the current measurement: units(columns), UTF-8 bytes,
+    /// pixel width, whether a line is loaded, and the widest width seen so far
     int totalUnits() const { return static_cast<int>(_layout.totalUnits); }
 
-    /// 当前行的字节数。
     int byteLength() const { return static_cast<int>(_layout.byteLength); }
 
-    /// 当前行的像素宽度。
     double lineWidth() const { return _layout.width; }
 
-    /// 当前行的明文。
+    /// the text we actually measured, surrogate pairs are placeholders here, don't feed
+    /// it back into the buffer as real text
     const QString &text() const { return _layout.text; }
 
-    /// 是否已经有行完成排版。
+    /// false before the first setLine(), the other readers hand back safe defaults then
     bool hasLine() const { return _valid; }
-
-    /// 已排版行的最大像素宽度。
     double maxWidth() const { return _maxWidth; }
 
-    /// 是否有行超过宽度上限，这类行的排版宽度按估算补齐。
+    /// true when some line went past the measuring cap, its tail is only an estimate then
     bool hasTruncatedLine() const { return _maxWidth > MaxMeasureWidth; }
 
-    /// 把列号换算成行内像素横坐标。
+    /// column to pixel, measured from the left edge of the line
     double xForColumn(int column) const;
 
-    /// 把行内像素横坐标换算成列号。
+    /// pixel to column, i.e. which column the caret lands on when you click at x
     int columnForX(double x) const;
 
-    /// 把行内字节下标换算成列号。
+    /// UTF-8 byte offset to column, for mapping a buffer position to a caret column
     int columnForByte(int byte) const;
 
-    /// 把列号换算成行内字节下标。
+    /// column back to the UTF-8 byte offset where that unit starts, the inverse direction
     int byteForColumn(int column) const;
 
-    /// 把列号收敛到合法范围，并避免落在代理对中间。
+    /// clamp a column into [0, totalUnits], handy before you index anything
     int clampColumn(int column) const;
 
-    /// 把字节下标回退到 UTF-8 字符起始位置。
+    /// walk an offset back to the start of its UTF-8 character, offsets inside a multibyte
+    /// character are moved left, we never hand you half of a character
     static uint32_t snapToCharStart(const char *data, uint32_t byteLength, uint32_t offset);
 
-    /// 单行最多测量多少像素，避免超长行的排版开销失控。
+    // pixel cap for measuring a single line
     static const int MaxMeasureWidth = 1024 * 1024;
 
 private:
-    /// 测量当前行，填充宽度表、字节长度表与锚点表。
+    /// measure the line we got from setLine(), fill every table in _layout
     void measureLine();
 
-    /// 找累计值不超过 value 的最后一个锚点，返回锚点序号。
+    /// the two anchor helpers: binary search the last sample whose accumulated value is
+    /// still <= value, and append a new sample, note the three anchor tables go together
     int anchorForValue(const QVector<int> &values, int value) const;
 
-    /// 记录一个锚点。
     void addAnchor(int unit, qreal width, int byte);
 
-    /// 计算一个 Unicode 码点编码成 UTF-8 后的字节数。
+    /// UTF-8 byte length of a code point: 1 / 2 / 3 / 4
     static int utf8Length(uint32_t codePoint);
 
-    /// 取得某个字符的显示宽度，代理对按整个码点缓存。
+    /// pixel width of one unit, cached by code point because we can't call the font a million times
     double glyphWidth(const QString &text, int index) const;
 
-    /// 把字符换算成缓存用的码点。
+    /// decode the code point at index, we read the low surrogate when there is one
     static uint32_t codePointAt(const QString &text, int index);
 
-    QFontMetricsF _metrics;      ///< 字体度量
-    LineLayout _layout;          ///< 当前行的排版信息
-    bool _valid = false;         ///< 当前行缓存是否可用
-    double _maxWidth = 0.0;      ///< 已排版行中的最大像素宽度
-    mutable QHash<uint32_t, double> _glyphWidths;  ///< 字符宽度缓存
+    QFontMetricsF _metrics;
+    LineLayout _layout;
+    bool _valid = false;
+    double _maxWidth = 0.0;
+    mutable QHash<uint32_t, double> _glyphWidths;
 };
 
 #endif // TEXTLAYOUT_H
